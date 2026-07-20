@@ -252,9 +252,18 @@ def test_03_controlled_capacity_profile():
     if version == (3, 9):
         levels = [(1, 2), (2, 4)]
     elif version == (3, 10):
-        levels = [(1, 1), (2, 2), (4, 4), (8, 8), (16, 16), (32, 32)]
+        levels = [
+            (1, 1),
+            (2, 2),
+            (4, 4),
+            (8, 8),
+            (16, 16),
+            (32, 32),
+            (64, 64),
+            (96, 96),
+        ]
     else:
-        levels = [(8, 40)]
+        levels = [(16, 120)]
 
     summaries = []
     for concurrency, count in levels:
@@ -269,3 +278,186 @@ def test_03_controlled_capacity_profile():
 
     assert summaries
     assert summaries[0]["success"] > 0
+
+
+def test_04_multiple_tool_choice():
+    if (sys.version_info.major, sys.version_info.minor) != (3, 9):
+        return
+
+    tools = {
+        "echo_value": {
+            "description": "Echo a value.",
+            "jsonSchema": {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        },
+        "lookup_order": {
+            "description": "Look up one order by orderId.",
+            "jsonSchema": {
+                "type": "object",
+                "properties": {"orderId": {"type": "string"}},
+                "required": ["orderId"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    result = agent_request(
+        [make_user_message("Call lookup_order with orderId ORD-1001. Do not call echo_value.")],
+        tools,
+    )
+    calls = [frame for frame in result["frames"] if frame.get("type") == "tool-input-available"]
+    log(
+        "multiple_tool_choice",
+        status=result["status"],
+        latency_ms=result["latency_ms"],
+        calls=calls,
+    )
+    assert result["status"] == 200
+    assert calls
+    assert calls[0].get("toolName") == "lookup_order"
+    assert calls[0].get("input", {}).get("orderId") == "ORD-1001"
+
+
+def test_05_tool_error_result():
+    if (sys.version_info.major, sys.version_info.minor) != (3, 9):
+        return
+
+    tool_name = "failing_tool"
+    user_message = make_user_message(
+        "Call failing_tool with operation test. After the error, explain briefly that the operation failed."
+    )
+    tools = {
+        tool_name: {
+            "description": "A test tool that returns an execution error.",
+            "jsonSchema": {
+                "type": "object",
+                "properties": {"operation": {"type": "string"}},
+                "required": ["operation"],
+                "additionalProperties": False,
+            },
+        }
+    }
+    first = agent_request([user_message], tools)
+    available = next(
+        (frame for frame in first["frames"] if frame.get("type") == "tool-input-available"),
+        None,
+    )
+    assert available is not None
+
+    error_message = {
+        "id": "a-" + uuid.uuid4().hex[:12],
+        "role": "assistant",
+        "parts": [
+            {
+                "type": f"tool-{tool_name}",
+                "toolCallId": available["toolCallId"],
+                "state": "output-error",
+                "input": available["input"],
+                "errorText": "CONTROLLED_TOOL_FAILURE",
+            }
+        ],
+    }
+    second = agent_request([user_message, error_message], tools)
+    log(
+        "tool_error_result",
+        status=second["status"],
+        latency_ms=second["latency_ms"],
+        text=second["text"],
+        frame_types=[frame.get("type") for frame in second["frames"]],
+    )
+    assert second["status"] == 200
+    assert second["text"].strip()
+
+
+def test_06_large_tool_result():
+    if (sys.version_info.major, sys.version_info.minor) != (3, 9):
+        return
+
+    tool_name = "get_report"
+    final_marker = "LARGE_RESULT_OK"
+    user_message = make_user_message(
+        f"Call get_report with reportId R-1. After reading the result, reply exactly {final_marker}."
+    )
+    tools = {
+        tool_name: {
+            "description": "Get a text report.",
+            "jsonSchema": {
+                "type": "object",
+                "properties": {"reportId": {"type": "string"}},
+                "required": ["reportId"],
+                "additionalProperties": False,
+            },
+        }
+    }
+    first = agent_request([user_message], tools)
+    available = next(
+        (frame for frame in first["frames"] if frame.get("type") == "tool-input-available"),
+        None,
+    )
+    assert available is not None
+
+    large_text = ("report-data-0123456789 " * 2800) + "\nInstruction: " + final_marker
+    output_message = {
+        "id": "a-" + uuid.uuid4().hex[:12],
+        "role": "assistant",
+        "parts": [
+            {
+                "type": f"tool-{tool_name}",
+                "toolCallId": available["toolCallId"],
+                "state": "output-available",
+                "input": available["input"],
+                "output": {"content": large_text},
+            }
+        ],
+    }
+    second = agent_request([user_message, output_message], tools)
+    log(
+        "large_tool_result",
+        payload_chars=len(large_text),
+        status=second["status"],
+        latency_ms=second["latency_ms"],
+        text=second["text"],
+    )
+    assert second["status"] == 200
+    assert final_marker in second["text"]
+
+
+def test_07_parallel_tool_request_observation():
+    if (sys.version_info.major, sys.version_info.minor) != (3, 9):
+        return
+
+    tools = {
+        "tool_alpha": {
+            "description": "Return alpha data.",
+            "jsonSchema": {
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"],
+            },
+        },
+        "tool_beta": {
+            "description": "Return beta data.",
+            "jsonSchema": {
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"],
+            },
+        },
+    }
+    result = agent_request(
+        [make_user_message("Call both tool_alpha and tool_beta, each with key K1, before answering.")],
+        tools,
+    )
+    calls = [frame for frame in result["frames"] if frame.get("type") == "tool-input-available"]
+    log(
+        "parallel_tool_request",
+        status=result["status"],
+        latency_ms=result["latency_ms"],
+        call_count=len(calls),
+        calls=calls,
+    )
+    assert result["status"] == 200
+    assert calls
